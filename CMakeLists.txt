@@ -8,7 +8,7 @@ include(CheckIncludeFile)
 
 set(tcmu-runner_HANDLER_PATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/tcmu-runner")
 
-option(with-glfs "build Gluster glfs handler" true)
+option(with-glfs "build Gluster glfs handler" false)
 option(with-qcow "build qcow handler" true)
 option(with-rbd "build Ceph rbd handler" true)
 
