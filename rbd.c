@@ -60,6 +60,13 @@
 #define RBD_WRITE_SAME_SUPPORT
 #endif
 
+/* defined in librbd.h if supported */
+#ifdef LIBRBD_SUPPORTS_IOVEC
+#if LIBRBD_SUPPORTS_IOVEC
+#define RBD_IOVEC_SUPPORT
+#endif
+#endif
+
 struct tcmu_rbd_state {
 	rados_t cluster;
 	rados_ioctx_t io_ctx;
@@ -68,13 +75,14 @@ struct tcmu_rbd_state {
 	char *image_name;
 	char *pool_name;
 	char *osd_op_timeout;
+	char *conf_path;
 };
 
 struct rbd_aio_cb {
 	struct tcmu_device *dev;
 	struct tcmulib_cmd *tcmulib_cmd;
 
-	/* Only for reading cmds */
+	bool read;
 	int64_t length;
 	char *bounce_buffer;
 };
@@ -112,6 +120,7 @@ static int tcmu_rbd_service_register(struct tcmu_device *dev)
 	struct utsname u;
 	char *daemon_buf = NULL;
 	char *metadata_buf = NULL;
+	char *image_id_buf = NULL;
 	int ret;
 
 	ret = uname(&u);
@@ -121,16 +130,30 @@ static int tcmu_rbd_service_register(struct tcmu_device *dev)
 		return ret;
 	}
 
+	image_id_buf = malloc(RBD_MAX_BLOCK_NAME_SIZE);
+	if (image_id_buf == NULL) {
+		tcmu_dev_err(dev, "Could not allocate image id buf.\n");
+		return -ENOMEM;
+	}
+
+	ret = rbd_get_id(state->image, image_id_buf, RBD_MAX_BLOCK_NAME_SIZE);
+	if (ret < 0) {
+		tcmu_dev_err(dev, "Could not retrieve image id.\n");
+		goto free_image_id_buf;
+	}
+
 	ret = asprintf(&daemon_buf, "%s:%s/%s",
 		       u.nodename, state->pool_name, state->image_name);
 	if (ret < 0) {
 		tcmu_dev_err(dev, "Could not allocate daemon buf.\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto free_image_id_buf;
 	}
 
-	ret = asprintf(&metadata_buf, "pool_name%c%s%cimage_name%c%s%c",
-		       '\0', state->pool_name, '\0',
-		       '\0', state->image_name, '\0');
+	ret = asprintf(&metadata_buf, "%s%c%s%c%s%c%s%c%s%c%s%c",
+		       "pool_name", '\0', state->pool_name, '\0',
+		       "image_name", '\0', state->image_name, '\0',
+		       "image_id", '\0', image_id_buf, '\0');
 	if (ret < 0) {
 		tcmu_dev_err(dev, "Could not allocate metadata buf.\n");
 		ret = -ENOMEM;
@@ -147,6 +170,8 @@ static int tcmu_rbd_service_register(struct tcmu_device *dev)
 	free(metadata_buf);
 free_daemon_buf:
 	free(daemon_buf);
+free_image_id_buf:
+	free(image_id_buf);
 	return ret;
 }
 
@@ -167,6 +192,120 @@ static void tcmu_rbd_service_status_update(struct tcmu_device *dev,
 #endif /* RBD_LOCK_ACQUIRE_SUPPORT */
 
 #endif /* LIBRADOS_SUPPORTS_SERVICES */
+
+static char *tcmu_rbd_find_quote(char *string)
+{
+	/* ignore escaped quotes */
+	while (true) {
+		string = strpbrk(string, "\"\\");
+		if (!string) {
+			break;
+		}
+
+		if (*string == '"') {
+			break;
+		}
+
+		if (*++string == '\0') {
+			break;
+		}
+
+		/* skip past the escaped character */
+		++string;
+	}
+	return string;
+}
+
+static void tcmu_rbd_detect_device_class(struct tcmu_device *dev)
+{
+	struct tcmu_rbd_state *state = tcmu_get_dev_private(dev);
+	char *mon_cmd_bufs[2] = {NULL, NULL};
+	char *mon_buf = NULL, *mon_status_buf = NULL;
+	size_t mon_buf_len = 0, mon_status_buf_len = 0;
+	char *crush_rule = NULL, *crush_rule_end = NULL;
+	int ret;
+
+	/* request the crush rule name for the image's pool */
+	ret = asprintf(&mon_cmd_bufs[0],
+		       "{\"prefix\": \"osd pool get\", "
+		        "\"pool\": \"%s\", "
+		        "\"var\": \"crush_rule\", "
+			"\"format\": \"json\"}", state->pool_name);
+	if (ret < 0) {
+		tcmu_dev_warn(dev, "Could not allocate crush rule command.\n");
+		return;
+	}
+
+	ret = rados_mon_command(state->cluster, (const char **)mon_cmd_bufs, 1,
+				"", 0, &mon_buf, &mon_buf_len,
+				&mon_status_buf, &mon_status_buf_len);
+	free(mon_cmd_bufs[0]);
+	if (ret < 0 || !mon_buf) {
+		tcmu_dev_warn(dev, "Could not retrieve pool crush rule (Err %d)\n",
+			      ret);
+		return;
+	}
+	rados_buffer_free(mon_status_buf);
+
+	/* expected JSON output: "{..."crush_rule":"<rule name>"...}" */
+	mon_buf[mon_buf_len] = '\0';
+	crush_rule = strstr(mon_buf, "\"crush_rule\":\"");
+	if (!crush_rule) {
+		tcmu_dev_warn(dev, "Could not locate crush rule key\n");
+		rados_buffer_free(mon_buf);
+		return;
+	}
+
+	/* skip past key to the start of the quoted rule name */
+	crush_rule += 13;
+	crush_rule_end = tcmu_rbd_find_quote(crush_rule + 1);
+	if (!crush_rule_end) {
+		tcmu_dev_warn(dev, "Could not extract crush rule\n");
+		rados_buffer_free(mon_buf);
+		return;
+	}
+
+	*(crush_rule_end + 1) = '\0';
+	crush_rule = strdup(crush_rule);
+	rados_buffer_free(mon_buf);
+	tcmu_dev_dbg(dev, "Pool %s using crush rule %s\n", state->pool_name,
+		     crush_rule);
+
+	/* request a list of crush rules associated to SSD device class */
+	ret = asprintf(&mon_cmd_bufs[0],
+		       "{\"prefix\": \"osd crush rule ls-by-class\", "
+		        "\"class\": \"ssd\", \"format\": \"json\"}");
+	if (ret < 0) {
+		tcmu_dev_warn(dev, "Could not allocate crush rule ls-by-class command.\n");
+		goto free_crush_rule;
+	}
+
+	ret = rados_mon_command(state->cluster, (const char **)mon_cmd_bufs, 1,
+				"", 0, &mon_buf, &mon_buf_len,
+				&mon_status_buf, &mon_status_buf_len);
+	free(mon_cmd_bufs[0]);
+	if (ret == -ENOENT) {
+		tcmu_dev_dbg(dev, "SSD not a registered device class.\n");
+		goto free_crush_rule;
+	} else if (ret < 0 || !mon_buf) {
+		tcmu_dev_warn(dev, "Could not retrieve pool crush rule ls-by-class (Err %d)\n",
+			      ret);
+		goto free_crush_rule;
+	}
+	rados_buffer_free(mon_status_buf);
+
+	/* expected JSON output: ["<rule name>",["<rule name>"...]] */
+	mon_buf[mon_buf_len] = '\0';
+	if (strstr(mon_buf, crush_rule)) {
+		tcmu_dev_dbg(dev, "Pool %s associated to SSD device class.\n",
+			     state->pool_name);
+		tcmu_set_dev_solid_state_media(dev, true);
+	}
+	rados_buffer_free(mon_buf);
+
+free_crush_rule:
+	free(crush_rule);
+}
 
 static void tcmu_rbd_image_close(struct tcmu_device *dev)
 {
@@ -263,8 +402,14 @@ static int tcmu_rbd_image_open(struct tcmu_device *dev)
 		return ret;
 	}
 
-	/* Fow now, we will only read /etc/ceph/ceph.conf */
-	rados_conf_read_file(state->cluster, NULL);
+	/* Try default location when conf_path=NULL, but ignore failure */
+	ret = rados_conf_read_file(state->cluster, state->conf_path);
+	if (state->conf_path && ret < 0) {
+		tcmu_dev_err(dev, "Could not read config %s (Err %d)",
+			     state->conf_path, ret);
+		goto rados_shutdown;
+	}
+
 	rados_conf_set(state->cluster, "rbd_cache", "false");
 
 	ret = timer_check_and_set_def(dev);
@@ -277,13 +422,10 @@ static int tcmu_rbd_image_open(struct tcmu_device *dev)
 	if (ret < 0) {
 		tcmu_dev_err(dev, "Could not connect to cluster. (Err %d)\n",
 			     ret);
-		goto set_cluster_null;
+		goto rados_shutdown;
 	}
 
-	ret = tcmu_rbd_service_register(dev);
-	if (ret < 0)
-		goto rados_shutdown;
-
+	tcmu_rbd_detect_device_class(dev);
 	ret = rados_ioctx_create(state->cluster, state->pool_name,
 				 &state->io_ctx);
 	if (ret < 0) {
@@ -298,14 +440,21 @@ static int tcmu_rbd_image_open(struct tcmu_device *dev)
 			     state->image_name, ret);
 		goto rados_destroy;
 	}
+
+	ret = tcmu_rbd_service_register(dev);
+	if (ret < 0)
+		goto rbd_close;
+
 	return 0;
 
+rbd_close:
+	rbd_close(state->image);
+	state->image = NULL;
 rados_destroy:
 	rados_ioctx_destroy(state->io_ctx);
 	state->io_ctx = NULL;
 rados_shutdown:
 	rados_shutdown(state->cluster);
-set_cluster_null:
 	state->cluster = NULL;
 	return ret;
 }
@@ -396,7 +545,7 @@ static int tcmu_rbd_lock_break(struct tcmu_device *dev, char **orig_owner)
 		tcmu_dev_err(dev, "Could not break lock from %s. (Err %d)\n",
 			     owners[0], ret);
 		if (ret == -ETIMEDOUT)
-			return ret;
+			goto free_owners;
 
 		ret = -EAGAIN;
 		if (!*orig_owner) {
@@ -496,6 +645,8 @@ static void tcmu_rbd_check_excl_lock_enabled(struct tcmu_device *dev)
 
 static void tcmu_rbd_state_free(struct tcmu_rbd_state *state)
 {
+	if (state->conf_path)
+		free(state->conf_path);
 	if (state->osd_op_timeout)
 		free(state->osd_op_timeout);
 	if (state->image_name)
@@ -505,13 +656,34 @@ static void tcmu_rbd_state_free(struct tcmu_rbd_state *state)
 	free(state);
 }
 
+static int tcmu_rbd_check_image_size(struct tcmu_device *dev, uint64_t new_size)
+{
+	struct tcmu_rbd_state *state = tcmu_get_dev_private(dev);
+	uint64_t rbd_size;
+	int ret;
+
+	ret = rbd_get_size(state->image, &rbd_size);
+	if (ret < 0) {
+		tcmu_dev_err(dev, "Could not get rbd size from cluster. Err %d.\n",
+			     ret);
+		return ret;
+	}
+
+	if (new_size != rbd_size) {
+		tcmu_dev_err(dev, "Mismatched sizes. RBD image size %" PRIu64 ". Requested new size %" PRIu64 ".\n",
+			     rbd_size, new_size);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int tcmu_rbd_open(struct tcmu_device *dev)
 {
 	rbd_image_info_t image_info;
 	char *pool, *name, *next_opt;
 	char *config, *dev_cfg_dup;
 	struct tcmu_rbd_state *state;
-	uint64_t rbd_size;
 	int ret;
 
 	state = calloc(1, sizeof(*state));
@@ -526,7 +698,10 @@ static int tcmu_rbd_open(struct tcmu_device *dev)
 		goto free_state;
 	}
 
-	tcmu_dev_dbg(dev, "tcmu_rbd_open config %s\n", config);
+	tcmu_dev_dbg(dev, "tcmu_rbd_open config %s block size %u num lbas %" PRIu64 ".\n",
+		     config, tcmu_get_dev_block_size(dev),
+		     tcmu_get_dev_num_lbas(dev));
+
 	config = strchr(config, '/');
 	if (!config) {
 		tcmu_dev_err(dev, "no configuration found in cfgstring\n");
@@ -573,6 +748,13 @@ static int tcmu_rbd_open(struct tcmu_device *dev)
 				tcmu_dev_err(dev, "Could not copy osd op timeout.\n");
 				goto free_config;
 			}
+		} else if (strncmp(next_opt, "conf=", 5)) {
+			state->conf_path = strdup(next_opt + 5);
+			if (!state->conf_path || !strlen(state->conf_path)) {
+				ret = -ENOMEM;
+				tcmu_dev_err(dev, "Could not copy conf path.\n");
+				goto free_config;
+			}
 		}
 	}
 
@@ -583,18 +765,9 @@ static int tcmu_rbd_open(struct tcmu_device *dev)
 
 	tcmu_rbd_check_excl_lock_enabled(dev);
 
-	ret = rbd_get_size(state->image, &rbd_size);
-	if (ret < 0) {
-		tcmu_dev_err(dev, "error getting rbd_size %s\n", name);
-		goto stop_image;
-	}
-
-	if (rbd_size !=
-	    tcmu_get_dev_num_lbas(dev) * tcmu_get_dev_block_size(dev)) {
-		tcmu_dev_err(dev, "device size and backing size disagree: device (num LBAs %lld, block size %ld) backing %lld\n",
-			     tcmu_get_dev_num_lbas(dev),
-			     tcmu_get_dev_block_size(dev), rbd_size);
-		ret = -EIO;
+	ret = tcmu_rbd_check_image_size(dev, tcmu_get_dev_block_size(dev) *
+					tcmu_get_dev_num_lbas(dev));
+	if (ret) {
 		goto stop_image;
 	}
 
@@ -608,8 +781,6 @@ static int tcmu_rbd_open(struct tcmu_device *dev)
 
 	tcmu_set_dev_write_cache_enabled(dev, 0);
 
-	tcmu_dev_dbg(dev, "config %s, size %lld\n", tcmu_get_dev_cfgstring(dev),
-		     rbd_size);
 	free(dev_cfg_dup);
 	return 0;
 
@@ -669,6 +840,66 @@ static int tcmu_rbd_handle_timedout_cmd(struct tcmu_device *dev,
 	return SAM_STAT_BUSY;
 }
 
+#ifdef RBD_IOVEC_SUPPORT
+
+static rbd_image_t tcmu_dev_to_image(struct tcmu_device *dev)
+{
+	struct tcmu_rbd_state *state = tcmu_get_dev_private(dev);
+	return state->image;
+}
+
+#define tcmu_rbd_aio_read(dev, aio_cb, completion, iov, iov_cnt, length, offset) \
+	rbd_aio_readv(tcmu_dev_to_image(dev), iov, iov_cnt, offset, completion);
+
+#define tcmu_rbd_aio_write(dev, aio_cb, completion, iov, iov_cnt, length, offset) \
+	rbd_aio_writev(tcmu_dev_to_image(dev), iov, iov_cnt, offset, completion);
+
+#else
+
+static int tcmu_rbd_aio_read(struct tcmu_device *dev, struct rbd_aio_cb *aio_cb,
+			     rbd_completion_t completion, struct iovec *iov,
+			     size_t iov_cnt, size_t length, off_t offset)
+{
+	struct tcmu_rbd_state *state = tcmu_get_dev_private(dev);
+	int ret;
+
+	aio_cb->bounce_buffer = malloc(length);
+	if (!aio_cb->bounce_buffer) {
+		tcmu_dev_err(dev, "Could not allocate bounce buffer.\n");
+		return -ENOMEM;
+	}
+
+	ret = rbd_aio_read(state->image, offset, length, aio_cb->bounce_buffer,
+			   completion);
+	if (ret < 0)
+		free(aio_cb->bounce_buffer);
+	return ret;
+}
+
+static int tcmu_rbd_aio_write(struct tcmu_device *dev, struct rbd_aio_cb *aio_cb,
+			      rbd_completion_t completion, struct iovec *iov,
+			      size_t iov_cnt, size_t length, off_t offset)
+{
+	struct tcmu_rbd_state *state = tcmu_get_dev_private(dev);
+	int ret;
+
+	aio_cb->bounce_buffer = malloc(length);
+	if (!aio_cb->bounce_buffer) {
+		tcmu_dev_err(dev, "Failed to allocate bounce buffer.\n");
+		return -ENOMEM;;
+	}
+
+	tcmu_memcpy_from_iovec(aio_cb->bounce_buffer, length, iov, iov_cnt);
+
+	ret = rbd_aio_write(state->image, offset, length, aio_cb->bounce_buffer,
+			    completion);
+	if (ret < 0)
+		free(aio_cb->bounce_buffer);
+	return ret;
+}
+
+#endif
+
 /*
  * NOTE: RBD async APIs almost always return 0 (success), except
  * when allocation (via new) fails - which is not caught. So,
@@ -696,7 +927,7 @@ static void rbd_finish_aio_generic(rbd_completion_t completion,
 	} else if (ret < 0) {
 		tcmu_dev_err(dev, "Got fatal IO error %d.\n", ret);
 
-		if (aio_cb->bounce_buffer)
+		if (aio_cb->read)
 			asc_ascq = ASC_READ_ERROR;
 		else
 			asc_ascq = ASC_WRITE_ERROR;
@@ -704,15 +935,17 @@ static void rbd_finish_aio_generic(rbd_completion_t completion,
 					     MEDIUM_ERROR, asc_ascq, NULL);
 	} else {
 		tcmu_r = SAM_STAT_GOOD;
-		if (aio_cb->bounce_buffer)
+		if (aio_cb->read && aio_cb->bounce_buffer) {
 			tcmu_memcpy_into_iovec(iovec, iov_cnt,
 					       aio_cb->bounce_buffer,
 					       aio_cb->length);
+		}
 	}
 
 	tcmulib_cmd->done(dev, tcmulib_cmd, tcmu_r);
 
-	free(aio_cb->bounce_buffer);
+	if (aio_cb->bounce_buffer)
+		free(aio_cb->bounce_buffer);
 	free(aio_cb);
 }
 
@@ -720,7 +953,6 @@ static int tcmu_rbd_read(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
 			     struct iovec *iov, size_t iov_cnt, size_t length,
 			     off_t offset)
 {
-	struct tcmu_rbd_state *state = tcmu_get_dev_private(dev);
 	struct rbd_aio_cb *aio_cb;
 	rbd_completion_t completion;
 	ssize_t ret;
@@ -734,31 +966,23 @@ static int tcmu_rbd_read(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
 	aio_cb->dev = dev;
 	aio_cb->length = length;
 	aio_cb->tcmulib_cmd = cmd;
-
-	aio_cb->bounce_buffer = malloc(length);
-	if (!aio_cb->bounce_buffer) {
-		tcmu_dev_err(dev, "Could not allocate bounce buffer.\n");
-		goto out_free_aio_cb;
-	}
+	aio_cb->read = true;
 
 	ret = rbd_aio_create_completion
 		(aio_cb, (rbd_callback_t) rbd_finish_aio_generic, &completion);
 	if (ret < 0) {
-		goto out_free_bounce_buffer;
+		goto out_free_aio_cb;
 	}
 
-	ret = rbd_aio_read(state->image, offset, length, aio_cb->bounce_buffer,
-			   completion);
-	if (ret < 0) {
-		goto out_remove_tracked_aio;
-	}
+	ret = tcmu_rbd_aio_read(dev, aio_cb, completion, iov, iov_cnt,
+				length, offset);
+	if (ret < 0)
+		goto out_release_tracked_aio;
 
 	return 0;
 
-out_remove_tracked_aio:
+out_release_tracked_aio:
 	rbd_aio_release(completion);
-out_free_bounce_buffer:
-	free(aio_cb->bounce_buffer);
 out_free_aio_cb:
 	free(aio_cb);
 out:
@@ -769,7 +993,6 @@ static int tcmu_rbd_write(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
 			  struct iovec *iov, size_t iov_cnt, size_t length,
 			  off_t offset)
 {
-	struct tcmu_rbd_state *state = tcmu_get_dev_private(dev);
 	struct rbd_aio_cb *aio_cb;
 	rbd_completion_t completion;
 	ssize_t ret;
@@ -783,33 +1006,24 @@ static int tcmu_rbd_write(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
 	aio_cb->dev = dev;
 	aio_cb->length = length;
 	aio_cb->tcmulib_cmd = cmd;
-
-	aio_cb->bounce_buffer = malloc(length);
-	if (!aio_cb->bounce_buffer) {
-		tcmu_dev_err(dev, "Failed to allocate bounce buffer.\n");
-		goto out_free_aio_cb;
-	}
-
-	tcmu_memcpy_from_iovec(aio_cb->bounce_buffer, length, iov, iov_cnt);
+	aio_cb->read = false;
 
 	ret = rbd_aio_create_completion
 		(aio_cb, (rbd_callback_t) rbd_finish_aio_generic, &completion);
 	if (ret < 0) {
-		goto out_free_bounce_buffer;
+		goto out_free_aio_cb;
 	}
 
-	ret = rbd_aio_write(state->image, offset,
-			    length, aio_cb->bounce_buffer, completion);
+	ret = tcmu_rbd_aio_write(dev, aio_cb, completion, iov, iov_cnt,
+				 length, offset);
 	if (ret < 0) {
-		goto out_remove_tracked_aio;
+		goto out_release_tracked_aio;
 	}
 
 	return 0;
 
-out_remove_tracked_aio:
+out_release_tracked_aio:
 	rbd_aio_release(completion);
-out_free_bounce_buffer:
-	free(aio_cb->bounce_buffer);
 out_free_aio_cb:
 	free(aio_cb);
 out:
@@ -833,6 +1047,7 @@ static int tcmu_rbd_unmap(struct tcmu_device *dev, struct tcmulib_cmd *cmd,
 
 	aio_cb->dev = dev;
 	aio_cb->tcmulib_cmd = cmd;
+	aio_cb->read = false;
 	aio_cb->bounce_buffer = NULL;
 
 	ret = rbd_aio_create_completion
@@ -872,6 +1087,7 @@ static int tcmu_rbd_flush(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 
 	aio_cb->dev = dev;
 	aio_cb->tcmulib_cmd = cmd;
+	aio_cb->read = false;
 	aio_cb->bounce_buffer = NULL;
 
 	ret = rbd_aio_create_completion
@@ -916,6 +1132,7 @@ static int tcmu_rbd_aio_writesame(struct tcmu_device *dev,
 
 	aio_cb->dev = dev;
 	aio_cb->tcmulib_cmd = cmd;
+	aio_cb->read = false;
 	aio_cb->length = tcmu_iovec_length(iov, iov_cnt);
 
 	aio_cb->bounce_buffer = malloc(aio_cb->length);
@@ -973,6 +1190,19 @@ static int tcmu_rbd_handle_cmd(struct tcmu_device *dev, struct tcmulib_cmd *cmd)
 	return ret;
 }
 
+static int tcmu_rbd_reconfig(struct tcmu_device *dev,
+			     struct tcmulib_cfg_info *cfg)
+{
+	switch (cfg->type) {
+	case TCMULIB_CFG_DEV_SIZE:
+		return tcmu_rbd_check_image_size(dev, cfg->data.dev_size);
+	case TCMULIB_CFG_DEV_CFGSTR:
+	case TCMULIB_CFG_WRITE_CACHE:
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 /*
  * For backstore creation
  *
@@ -990,7 +1220,8 @@ static const char tcmu_rbd_cfg_desc[] =
 	"where:\n"
 	"poolname:	Existing RADOS pool\n"
 	"devicename:	Name of the RBD image\n"
-	"optionN:	Like: \"osd_op_timeout=30\" in secs\n";
+	"optionN:	Like: \"osd_op_timeout=30\" in secs\n"
+	"                     \"conf=/etc/ceph/cluster.conf\"\n";
 
 struct tcmur_handler tcmu_rbd_handler = {
 	.name	       = "Ceph RBD handler",
@@ -1000,6 +1231,7 @@ struct tcmur_handler tcmu_rbd_handler = {
 	.close	       = tcmu_rbd_close,
 	.read	       = tcmu_rbd_read,
 	.write	       = tcmu_rbd_write,
+	.reconfig      = tcmu_rbd_reconfig,
 #ifdef LIBRBD_SUPPORTS_AIO_FLUSH
 	.flush	       = tcmu_rbd_flush,
 #endif

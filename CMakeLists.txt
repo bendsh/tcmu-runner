@@ -9,8 +9,8 @@ include(CheckIncludeFile)
 set(tcmu-runner_HANDLER_PATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/tcmu-runner")
 
 option(with-glfs "build Gluster glfs handler" false)
-option(with-qcow "build qcow handler" true)
-option(with-rbd "build Ceph rbd handler" true)
+option(with-qcow "build qcow handler" false)
+option(with-rbd "build Ceph rbd handler" false)
 
 find_library(LIBNL_LIB nl-3)
 find_library(LIBNL_GENL_LIB nl-genl-3)
